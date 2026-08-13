@@ -1,22 +1,27 @@
 /**
  * QAVANAH API™ - Le Gardien de Trajectoire
  * Makom Intelligence™ · CorreIA LLC
- * Version : 0.3.0
+ * Version : 0.4.0
  * Date : 2026-08-13
- * Correction : Étape 9 · Scores d'alignement réels · catégories d'actions
+ * Correction : Étape 10 · COA™ · Moteur de Trajectoire · Tension / Slope / AUC
  *
- * Étapes couvertes : 0→9
+ * Étapes couvertes : 0→10
  * Module Zera haMakom™ : ZM-DEV-001
  *
  * Q = f(I, C, T, A, R, Z)
  *
- * DÉCISION v0.3.0 · LOI DE SCORING ZERA :
- * convergence (TENSION/FORTE/PARTIELLE) = donnée observée · signal diagnostique
- * convergence ≠ pénalité sur score zera
- * convergence → enregistrée dans réponse Qavanah pour corrélation future
- * Raison : aucune calibration empirique disponible à ce stade.
- * Transformer une observation en règle normative sans calibration
- * est interdit (BH-068 · mode OBSERVE).
+ * DÉCISIONS v0.4.0 · LOI COA :
+ *
+ * Score composite = intent×0.4 + context×0.3 + action×0.2 + zera×0.1
+ * Poids EXPÉRIMENTAUX · non constitutionnels · calibrage empirique requis (BH-068)
+ * Score MIN conservé comme indicateur complémentaire · pas score COA principal
+ *
+ * Tension = (1.0 - composite_score) × 1000
+ * Référence = 1.0 (alignement parfait)
+ * Mode OBSERVATION : tension calculée · ne bloque pas · ne déclenche pas BLOCK automatique
+ *
+ * DÉCISION v0.3.0 · LOI DE SCORING ZERA (maintenue) :
+ * convergence = donnée observée · signal diagnostique · pas de pénalité.
  */
 
 'use strict';
@@ -231,6 +236,93 @@ function computeAlignmentScores(intent, context, action, zera) {
   return { scores, signals };
 }
 
+// ─── ÉTAPE 10 · MOTEUR COA™ · TRAJECTOIRE ───────────────────────────────────
+// Calcul Tension / Slope / AUC sur série temporelle d'alignement
+// Scénario référence QAV-DEV-001 §11 :
+//   CP-1 tension=143.7 → NORMAL
+//   CP-2 tension=246.2 · slope=+102.6 → WARNING
+//   CP-3 tension=893.4 · AUC=1283 → DRIFT confirmé
+//
+// DÉCISION v0.4.0 :
+//   Tension   = (1.0 - composite_score) × 1000
+//   Composite = intent×0.4 + context×0.3 + action×0.2 + zera×0.1
+//   Poids expérimentaux · calibrage empirique requis (BH-068)
+//   Mode OBSERVE : COA calcule · ne bloque pas · ne déclenche pas BLOCK automatique
+
+// Seuils initiaux (non calibrés · expérimentaux · BH-068)
+const COA_THRESHOLDS = {
+  WARNING_TENSION:  200,   // tension > 200 → WARNING
+  DRIFT_TENSION:    500,   // tension > 500 → DRIFT
+  WARNING_SLOPE:     80,   // pente > 80 par étape → alerte précoce
+  DRIFT_AUC:       1000,   // AUC > 1000 → dérive confirmée
+};
+
+function computeCompositeScore(alignment) {
+  // Poids expérimentaux v0.4.0
+  const w = { intent: 0.4, context: 0.3, action: 0.2, zera: 0.1 };
+  const i = alignment.intent  != null ? alignment.intent  : 0;
+  const c = alignment.context != null ? alignment.context : 0;
+  const a = alignment.action  != null ? alignment.action  : 0;
+  const z = alignment.zera    != null ? alignment.zera    : i; // fallback sur intent si zera absent
+
+  const composite = i * w.intent + c * w.context + a * w.action + z * w.zera;
+  const min_score = Math.min(i, c, a, z);
+
+  return {
+    composite: parseFloat(composite.toFixed(4)),
+    min_score: parseFloat(min_score.toFixed(4)),
+    weights:   w,
+    note:      'poids_experimentaux_v0.4.0'
+  };
+}
+
+function computeTension(composite_score) {
+  // Tension = (1.0 - composite) × 1000
+  // Référence = 1.0 (alignement parfait)
+  return parseFloat(((1.0 - composite_score) * 1000).toFixed(2));
+}
+
+function computeSlope(tensionSeries) {
+  // Pente entre les deux derniers points
+  if (!tensionSeries || tensionSeries.length < 2) return null;
+  const last = tensionSeries[tensionSeries.length - 1];
+  const prev = tensionSeries[tensionSeries.length - 2];
+  return parseFloat((last - prev).toFixed(2));
+}
+
+function computeAUC(tensionSeries) {
+  // Aire sous la courbe (somme trapézoïdale)
+  if (!tensionSeries || tensionSeries.length < 2) return null;
+  let auc = 0;
+  for (let i = 1; i < tensionSeries.length; i++) {
+    auc += (tensionSeries[i] + tensionSeries[i - 1]) / 2;
+  }
+  return parseFloat(auc.toFixed(2));
+}
+
+function computeDriftState(tension, slope, auc) {
+  // Mode OBSERVE : calcule l'état · ne bloque pas
+  // Séquence : NORMAL → WARNING → DRIFT
+  if (auc != null && auc > COA_THRESHOLDS.DRIFT_AUC) return 'DRIFT';
+  if (tension > COA_THRESHOLDS.DRIFT_TENSION)         return 'DRIFT';
+  if (slope != null && slope > COA_THRESHOLDS.WARNING_SLOPE) return 'WARNING';
+  if (tension > COA_THRESHOLDS.WARNING_TENSION)       return 'WARNING';
+  return 'NORMAL';
+}
+
+// Récupérer ou initialiser la série de tensions d'une trajectoire
+function getTensionSeries(trajectoryId) {
+  const key = `coa_series_${trajectoryId}`;
+  if (!inMemoryStore[key]) inMemoryStore[key] = [];
+  return inMemoryStore[key];
+}
+
+function appendTension(trajectoryId, tension) {
+  const series = getTensionSeries(trajectoryId);
+  series.push(tension);
+  return series;
+}
+
 // ─── MOTEUR DÉTERMINISTE ─────────────────────────────────────────────────────
 // Étape 6 · opère AVANT les scores · BH-384
 
@@ -325,18 +417,19 @@ function buildZeraSeed({ icl, lat, lon, territory, place, voies, relations, obse
 
 app.get('/health', (req, res) => {
   res.json({
-    service:   'qavanah-api', status: 'ok', version: '0.3.0',
-    mode:      QAVANAH_MODE, etape: 9,
+    service:   'qavanah-api', status: 'ok', version: '0.4.0',
+    mode:      QAVANAH_MODE, etape: 10,
     modules:   ['kernel','trajectory','intent','context','action',
                 'rule-engine','decision-engine','event-log',
-                'zera-hamakom','alignment-scoring'],
-    scoring: {
-      intent:  'source-based',
-      context: 'completeness-based',
-      action:  'family-based',
-      zera:    'formation-based',
-      convergence_penalty: false,
-      note: 'OBSERVE · no calibration yet'
+                'zera-hamakom','alignment-scoring','coa-trajectory'],
+    coa: {
+      composite:          'intent×0.4 + context×0.3 + action×0.2 + zera×0.1',
+      tension:            '(1.0 - composite) × 1000',
+      reference:          1.0,
+      thresholds:         COA_THRESHOLDS,
+      weights_status:     'experimental · calibrage_requis',
+      blocking:           false,
+      note:               'OBSERVE · no automatic blocking'
     },
     db: db ? 'postgresql' : 'in-memory', timestamp: now()
   });
@@ -344,19 +437,21 @@ app.get('/health', (req, res) => {
 
 app.get('/version', (req, res) => {
   res.json({
-    service: 'qavanah-api', version: '0.3.0',
+    service: 'qavanah-api', version: '0.4.0',
     codex: 'QAV-0001', devops: 'QAV-DEV-001',
     zera: 'ZM-DEV-001', raqia: 'QAV-RAQIA-001', hoqim: 'QAV-HOQ-001',
     mode: QAVANAH_MODE,
     formula: 'Q = f(I, C, T, A, R, Z)',
-    scoring_v0_3_0: {
-      intent:  'USER_CONFIRMED=1.0 · EXPLICIT=0.95 · PROVISIONAL=0.5',
-      context: 'contextId=0.5 + icl=+0.25 + place=+0.15 + state=+0.10',
-      action:  'scope_match=1.0 · family_LECTURE=0.95 · family_NAV=0.90 · ...',
-      zera:    'formed=0.70 + spatial=+0.10 + road=+0.10 + boundary=+0.05 + thresh=+0.05',
-      convergence_penalty: 'false · v0.3.0 · OBSERVE only'
+    coa_v0_4_0: {
+      composite:  'intent×0.4 + context×0.3 + action×0.2 + zera×0.1',
+      tension:    '(1.0 - composite) × 1000',
+      slope:      'tensionSeries[n] - tensionSeries[n-1]',
+      auc:        'somme trapézoïdale de la série',
+      drift:      'NORMAL → WARNING → DRIFT',
+      thresholds: COA_THRESHOLDS,
+      blocking:   false
     },
-    etapesCouvertes: [0,1,2,3,4,5,6,7,8,'ZM',9],
+    etapesCouvertes: [0,1,2,3,4,5,6,7,8,'ZM',9,10],
     releasedAt: '2026-08-13'
   });
 });
@@ -620,6 +715,18 @@ app.post('/v1/qavanah/check', async (req, res) => {
   const { scores, signals } = computeAlignmentScores(intent, context, action,
     context && context.zera ? context.zera : null);
 
+  // ── Moteur COA™ (Étape 10) · Tension / Slope / AUC ─────────────────────────
+  const compositeResult  = computeCompositeScore(scores);
+  const tension          = computeTension(compositeResult.composite);
+  const tensionSeries    = appendTension(trajectoryId, tension);
+  const slope            = computeSlope(tensionSeries);
+  const auc              = computeAUC(tensionSeries);
+  const driftState       = computeDriftState(tension, slope, auc);
+
+  // Signal précoce : slope seul peut déclencher WARNING avant tension élevée
+  // QAV-DEV-001 §11 : "la pente détecte la dérive avant que le score final seul ne puisse la caractériser"
+  const earlyDriftSignal = slope != null && slope > COA_THRESHOLDS.WARNING_SLOPE;
+
   // ── Référence Zera ──────────────────────────────────────────────────────────
   const contextZera = context && context.zera ? context.zera : null;
   const zeraRef = contextZera ? {
@@ -637,10 +744,12 @@ app.post('/v1/qavanah/check', async (req, res) => {
 
     // Scores d'alignement réels (Étape 9)
     alignment: {
-      intent:  scores.intent,
-      context: scores.context,
-      action:  scores.action,
-      zera:    scores.zera
+      intent:    scores.intent,
+      context:   scores.context,
+      action:    scores.action,
+      zera:      scores.zera,
+      composite: compositeResult.composite,
+      min_score: compositeResult.min_score
     },
 
     // Signals observationnels (pour calibration future)
@@ -655,7 +764,20 @@ app.post('/v1/qavanah/check', async (req, res) => {
 
     zera: zeraRef,
 
-    drift: { state:'NORMAL', tension:null, slope:null, auc:null },
+    // COA™ · Moteur de Trajectoire (Étape 10)
+    // Mode OBSERVE : calculé · pas de blocage automatique (BH-068)
+    drift: {
+      state:            driftState,
+      tension:          tension,
+      slope:            slope,
+      auc:              auc,
+      step:             tensionSeries.length,
+      series:           tensionSeries,
+      early_signal:     earlyDriftSignal,
+      thresholds:       COA_THRESHOLDS,
+      composite_weights: compositeResult.weights,
+      note:             'MODE_OBSERVE · pas_de_blocage_automatique · calibrage_requis'
+    },
 
     authorization: { status: ruleResult.decision === 'ALLOW' ? 'AUTHORIZED' : 'REFUSED' },
 
@@ -673,8 +795,17 @@ app.post('/v1/qavanah/check', async (req, res) => {
   const eventType = ruleResult.decision === 'ALLOW' ? 'DecisionAllowed'
     : ruleResult.decision === 'ADJUST' ? 'DecisionAdjusted' : 'DecisionBlocked';
 
+  // Log drift si signal détecté
+  if (driftState !== 'NORMAL') {
+    await logEvent('DriftDetected', {
+      checkId, trajectoryId, driftState,
+      tension, slope, auc, step: tensionSeries.length,
+      earlySignal: earlyDriftSignal
+    });
+  }
+
   await logEvent(eventType, { checkId, trajectoryId, decision:ruleResult.decision,
-    actionType:action?.type, alignment:scores });
+    actionType:action?.type, alignment:scores, coa:{ tension, slope, auc, driftState } });
   await logEvent('ActionChecked', { checkId, trajectoryId, actionType:action?.type });
 
   res.json(decisionPayload);
@@ -685,7 +816,33 @@ app.get('/v1/trajectories/:id/signals', (req, res) => {
   const { id } = req.params;
   const events    = inMemoryStore.events.filter(e => e.payload && e.payload.trajectoryId === id);
   const decisions = Object.values(inMemoryStore.decisions).filter(d => d.trajectoryId === id);
-  res.json({ trajectoryId:id, eventCount:events.length, events, decisions, driftSignals:[] });
+  const series    = getTensionSeries(id);
+  const driftEvents = events.filter(e => e.eventType === 'DriftDetected');
+
+  // Recalcul des métriques COA depuis la série complète
+  const slope = computeSlope(series);
+  const auc   = computeAUC(series);
+  const driftState = series.length > 0
+    ? computeDriftState(series[series.length-1], slope, auc)
+    : 'NORMAL';
+
+  res.json({
+    trajectoryId: id,
+    eventCount:   events.length,
+    events,
+    decisions,
+    coa: {
+      tensionSeries:  series,
+      steps:          series.length,
+      currentTension: series.length > 0 ? series[series.length-1] : null,
+      slope,
+      auc,
+      driftState,
+      driftEvents,
+      thresholds: COA_THRESHOLDS,
+      note: 'MODE_OBSERVE · pas_de_blocage_automatique'
+    }
+  });
 });
 
 app.get('/v1/trajectories/:id/decision', (req, res) => {
@@ -762,11 +919,11 @@ initDb().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════╗');
-    console.log('║   QAVANAH API™ v0.3.0 · Le Gardien de Trajectoire   ║');
+    console.log('║   QAVANAH API™ v0.4.0 · Le Gardien de Trajectoire   ║');
     console.log('║   Makom Intelligence™ · CorreIA LLC                  ║');
     console.log(`║   Port : ${PORT}  ·  Mode : ${QAVANAH_MODE.padEnd(7)}                    ║`);
-    console.log('║   Q = f(I,C,T,A,R,Z) · Étape 9 · Scoring réel      ║');
-    console.log('║   convergence=TENSION → signal · pas de pénalité    ║');
+    console.log('║   Q = f(I,C,T,A,R,Z) · Étape 10 · COA™             ║');
+    console.log('║   Tension/Slope/AUC · OBSERVE · pas de blocage auto ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
   });
