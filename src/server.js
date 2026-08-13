@@ -1,11 +1,12 @@
 /**
  * QAVANAH API™ - Le Gardien de Trajectoire
  * Makom Intelligence™ · CorreIA LLC
- * Version : 0.4.0
+ * Version : 0.5.0
  * Date : 2026-08-13
- * Correction : Étape 10 · COA™ · Moteur de Trajectoire · Tension / Slope / AUC
+ * Correction : Étape 12 · RE-ANCHOR avec reset COA · Ancre v1 obligatoire
+ *              Étape 13 · TAL simulé · POST /v1/tal/execute
  *
- * Étapes couvertes : 0→10
+ * Étapes couvertes : 0→13
  * Module Zera haMakom™ : ZM-DEV-001
  *
  * Q = f(I, C, T, A, R, Z)
@@ -417,11 +418,12 @@ function buildZeraSeed({ icl, lat, lon, territory, place, voies, relations, obse
 
 app.get('/health', (req, res) => {
   res.json({
-    service:   'qavanah-api', status: 'ok', version: '0.4.0',
-    mode:      QAVANAH_MODE, etape: 10,
+    service:   'qavanah-api', status: 'ok', version: '0.5.0',
+    mode:      QAVANAH_MODE, etape: 13,
     modules:   ['kernel','trajectory','intent','context','action',
                 'rule-engine','decision-engine','event-log',
-                'zera-hamakom','alignment-scoring','coa-trajectory'],
+                'zera-hamakom','alignment-scoring','coa-trajectory',
+                'reanchor-coa-reset','tal-simulated'],
     coa: {
       composite:          'intent×0.4 + context×0.3 + action×0.2 + zera×0.1',
       tension:            '(1.0 - composite) × 1000',
@@ -437,7 +439,7 @@ app.get('/health', (req, res) => {
 
 app.get('/version', (req, res) => {
   res.json({
-    service: 'qavanah-api', version: '0.4.0',
+    service: 'qavanah-api', version: '0.5.0',
     codex: 'QAV-0001', devops: 'QAV-DEV-001',
     zera: 'ZM-DEV-001', raqia: 'QAV-RAQIA-001', hoqim: 'QAV-HOQ-001',
     mode: QAVANAH_MODE,
@@ -531,22 +533,7 @@ app.get('/v1/intents/:contractId', (req, res) => {
   res.json({ contractId: req.params.contractId, versions: anchors });
 });
 
-app.post('/v1/intents/:contractId/reanchor', async (req, res) => {
-  const { contractId } = req.params;
-  const { trajectoryId, reason, objectives, constraints, scope } = req.body;
-  const existing = Object.values(inMemoryStore.intent_anchors)
-    .filter(a => a.contractId === contractId).sort((a,b) => b.version - a.version)[0];
-  const newVersion = existing ? existing.version + 1 : 1;
-  const hash = hashObject({ contractId, intentVersion: newVersion, objectives, constraints, scope });
-  const anchorId = generateId('ANC'), createdAt = now();
-  const anchor = { id:anchorId, contractId, trajectoryId, version:newVersion,
-    hash:`sha256:${hash}`, embeddingModel:'none-v0.1', embeddingVersion:'0.1',
-    source:'USER_CONFIRMED', objectives, constraints, scope,
-    sealed:true, createdAt, reanchorReason: reason||'USER_CHANGED_INTENT' };
-  inMemoryStore.intent_anchors[anchorId] = anchor;
-  await logEvent('IntentReanchored', { trajectoryId, contractId, previousVersion:existing?.version, newVersion, reason });
-  res.status(201).json({ intentAnchor:anchor, event:'RE-ANCHOR', previousVersion:existing?.version });
-});
+// reanchor défini plus bas avec reset COA (v0.5.0)
 
 // ── CONTEXT SNAPSHOT ──────────────────────────────────────────────────────────
 app.post('/v1/context/snapshot', async (req, res) => {
@@ -854,6 +841,226 @@ app.get('/v1/trajectories/:id/decision', (req, res) => {
   res.json({ trajectoryId:id, latest:decisions[0], history:decisions });
 });
 
+// ── REANCHOR avec reset COA ───────────────────────────────────────────────────
+// Décision v0.5.0 : RE-ANCHOR archive la série passée et ouvre série_v2 = [0]
+// La mémoire historique reste accessible · la nouvelle ancre ouvre une nouvelle fenêtre
+
+app.post('/v1/intents/:contractId/reanchor', async (req, res) => {
+  const { contractId } = req.params;
+  const { trajectoryId, reason, objectives, constraints, scope } = req.body;
+
+  // Trouver la version courante
+  const existing = Object.values(inMemoryStore.intent_anchors)
+    .filter(a => a.contractId === contractId)
+    .sort((a, b) => b.version - a.version)[0];
+
+  if (!existing) {
+    return res.status(404).json({
+      error: 'ANCHOR_NOT_FOUND',
+      hint: 'POST /v1/intents/:id/anchor requis avant reanchor · loi BH-001'
+    });
+  }
+
+  const newVersion = existing.version + 1;
+  const hash       = hashObject({ contractId, intentVersion: newVersion, objectives, constraints, scope });
+  const anchorId   = generateId('ANC');
+  const createdAt  = now();
+
+  const anchor = {
+    id: anchorId, contractId, trajectoryId,
+    version: newVersion, hash: `sha256:${hash}`,
+    embeddingModel: 'none-v0.1', embeddingVersion: '0.1',
+    source: 'USER_CONFIRMED', objectives, constraints, scope,
+    sealed: true, createdAt,
+    reanchorReason: reason || 'USER_CHANGED_INTENT'
+  };
+
+  inMemoryStore.intent_anchors[anchorId] = anchor;
+
+  // Reset COA : archiver la série passée · ouvrir série_v2 = [0]
+  if (trajectoryId) {
+    const currentKey  = `coa_series_${trajectoryId}`;
+    const archiveKey  = `coa_archive_${trajectoryId}_v${existing.version}`;
+    const currentSeries = inMemoryStore[currentKey] || [];
+
+    // Archiver la série passée
+    inMemoryStore[archiveKey] = {
+      series:    currentSeries,
+      anchorVersion: existing.version,
+      archivedAt: now(),
+      reason:    reason || 'USER_CHANGED_INTENT'
+    };
+
+    // Ouvrir nouvelle série à [0]
+    inMemoryStore[currentKey] = [0];
+
+    await logEvent('COASeriesReset', {
+      trajectoryId,
+      previousVersion: existing.version,
+      newVersion,
+      archivedSeries: currentSeries,
+      archiveKey
+    });
+  }
+
+  await logEvent('IntentReanchored', {
+    trajectoryId, contractId,
+    previousVersion: existing.version,
+    newVersion, reason
+  });
+
+  res.status(201).json({
+    intentAnchor:    anchor,
+    event:           'RE-ANCHOR',
+    previousVersion: existing.version,
+    coa: {
+      reset:          true,
+      newSeries:      [0],
+      archivedVersion: existing.version,
+      note:           'COA_SERIES_RESET · nouvelle fenêtre de mesure ouverte'
+    }
+  });
+});
+
+// ── TERRITORY ACTION LAYER™ · SIMULÉ (Étape 13) ───────────────────────────────
+// TAL simulé dans qavanah-api · pas encore connecté à McOmH.ai
+// Loi : le TAL ne reçoit que depuis un ALLOW explicite de Qavanah (BH-384)
+// Catalogue actions simulées avec résultats réalistes pour Cocody
+
+const TAL_SIMULATED_RESULTS = {
+  SEARCH_PLACE: (params) => ({
+    found: true,
+    place: {
+      name: params.query || 'Lieu inconnu',
+      icl:  '4331|2136',
+      address: `${params.query} · Cocody · Abidjan`,
+      source: 'PADA_COCODY_SIMULATED'
+    }
+  }),
+  FLY_TO: (params) => ({
+    executed: true,
+    destination: params.icl || params.coordinates || 'inconnu',
+    mapState: { zoom: 16, centered: true }
+  }),
+  HIGHLIGHT_ROAD: (params) => ({
+    executed: true,
+    road: params.roadName || 'voie inconnue',
+    highlighted: true
+  }),
+  HIGHLIGHT_PLACE: (params) => ({
+    executed: true,
+    place: params.placeName || 'lieu inconnu',
+    highlighted: true
+  }),
+  ZOOM_TO: (params) => ({
+    executed: true,
+    zoom: params.level || 15
+  }),
+  RESET_VIEW: () => ({
+    executed: true,
+    mapState: { zoom: 12, centered: false }
+  }),
+  PLACE_MARKER: (params) => ({
+    executed: true,
+    marker: { icl: params.icl || null, label: params.label || 'Marqueur' }
+  }),
+  START_GPS: () => ({
+    executed: true,
+    gps: { status: 'ACTIVE', accuracy: 10 }
+  }),
+  SEARCH_NUMBER: (params) => {
+    // Loi de Non-invention : si noData → NO_DATA · jamais de numéro inventé
+    if (params.noData) return { found: false, status: 'NO_DATA', law: 'NON_INVENTION' };
+    return { found: true, number: params.query, source: 'PADA_COCODY_SIMULATED' };
+  }
+};
+
+app.post('/v1/tal/execute', async (req, res) => {
+  const { decisionId, actionId, action, trajectoryId } = req.body;
+
+  // Vérification : l'action ne peut entrer dans le TAL que depuis un ALLOW
+  // Récupérer la décision depuis le store
+  const decision = decisionId ? inMemoryStore.decisions[decisionId] : null;
+
+  if (decisionId && decision && decision.decision !== 'ALLOW') {
+    await logEvent('TALBlocked', {
+      trajectoryId, decisionId, actionId,
+      reason: `DECISION_WAS_${decision.decision}_NOT_ALLOW`
+    });
+    return res.status(403).json({
+      error:      'TAL_BLOCKED',
+      reason:     `La décision ${decisionId} est ${decision.decision} · pas ALLOW`,
+      law:        'BH-384 · BH-390 · Autorisation préalable obligatoire',
+      decisionId,
+      expected:   'ALLOW',
+      received:   decision ? decision.decision : 'NOT_FOUND'
+    });
+  }
+
+  if (!action || !action.type) {
+    return res.status(400).json({ error: 'ACTION_TYPE_REQUIRED' });
+  }
+
+  // Simuler l'exécution
+  const simulator = TAL_SIMULATED_RESULTS[action.type];
+  const result    = simulator
+    ? simulator(action.parameters || {})
+    : { executed: false, reason: 'ACTION_NOT_SIMULATED' };
+
+  const executedAt = now();
+  const actionResult = {
+    actionId:    actionId || generateId('ACT'),
+    type:        action.type,
+    status:      result.found === false && result.status === 'NO_DATA' ? 'NO_DATA' : 'SUCCESS',
+    result,
+    executedAt,
+    source:      'territory-action-layer-simulated',
+    decisionId:  decisionId || null,
+    trajectoryId: trajectoryId || null
+  };
+
+  // Stocker le résultat pour la boucle Ayin haMakom™
+  if (actionResult.actionId) {
+    inMemoryStore[`result_${actionResult.actionId}`] = actionResult;
+  }
+
+  await logEvent('ActionExecuted', {
+    trajectoryId, actionId: actionResult.actionId,
+    type: action.type, status: actionResult.status
+  });
+
+  await logEvent('ActionResultReceived', {
+    trajectoryId, actionId: actionResult.actionId,
+    status: actionResult.status
+  });
+
+  res.json({
+    actionResult,
+    next: 'RETURN_TO_AYIN_HAMAKOM',
+    note: 'TAL_SIMULATED · connecter à McOmH.ai en Étape 16'
+  });
+});
+
+// GET historique des résultats d'une trajectoire
+app.get('/v1/trajectories/:id/results', (req, res) => {
+  const { id } = req.params;
+  const results = Object.entries(inMemoryStore)
+    .filter(([k]) => k.startsWith('result_'))
+    .map(([, v]) => v)
+    .filter(r => r.trajectoryId === id);
+  res.json({ trajectoryId: id, results });
+});
+
+// GET archives COA d'une trajectoire (mémoire historique)
+app.get('/v1/trajectories/:id/coa-archives', (req, res) => {
+  const { id } = req.params;
+  const archives = Object.entries(inMemoryStore)
+    .filter(([k]) => k.startsWith(`coa_archive_${id}`))
+    .map(([k, v]) => ({ key: k, ...v }));
+  const currentSeries = getTensionSeries(id);
+  res.json({ trajectoryId: id, currentSeries, archives });
+});
+
 // ── INIT DB ───────────────────────────────────────────────────────────────────
 async function initDb() {
   if (!db) return;
@@ -919,11 +1126,11 @@ initDb().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════╗');
-    console.log('║   QAVANAH API™ v0.4.0 · Le Gardien de Trajectoire   ║');
+    console.log('║   QAVANAH API™ v0.5.0 · Le Gardien de Trajectoire   ║');
     console.log('║   Makom Intelligence™ · CorreIA LLC                  ║');
     console.log(`║   Port : ${PORT}  ·  Mode : ${QAVANAH_MODE.padEnd(7)}                    ║`);
-    console.log('║   Q = f(I,C,T,A,R,Z) · Étape 10 · COA™             ║');
-    console.log('║   Tension/Slope/AUC · OBSERVE · pas de blocage auto ║');
+    console.log('║   Étapes 0→13 · RE-ANCHOR reset COA · TAL simulé   ║');
+    console.log('║   POST /v1/tal/execute · GET /coa-archives          ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
   });
