@@ -1,0 +1,24 @@
+{
+  "name": "qavanah-api",
+  "version": "0.1.0",
+  "description": "QAVANAH API - Gardien de Trajectoire - Makom Intelligence",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "test": "node tests/test-etape0.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.0",
+    "crypto": "^1.0.1"
+  },
+  "keywords": ["qavanah", "makom-intelligence", "agent-governance"],
+  "author": "Makom Intelligence - CorreIA LLC",
+  "license": "UNLICENSED"
+}
