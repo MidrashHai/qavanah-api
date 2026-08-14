@@ -1,16 +1,14 @@
 /**
  * QAVANAH API™ - Le Gardien de Trajectoire
  * Makom Intelligence™ · CorreIA LLC
- * Version : 0.6.2
+ * Version : 0.7.0
  * Date : 2026-08-14
- * Correction : SEARCH_PLACE transmet l'ICL de contexte · tri par proximité ICL
- *              padaSearchPlace(query, contextIcl) → résultats triés
+ * Phase 1 · HSC Registry · qav_sequence_contracts
+ *           POST /v1/sequences · GET /v1/sequences/:id
+ *           INSERT SEQ-SEARCH-PLACE-001 v1.0
  *
- * Observation TA-QAV-015 : ICL retourné = premier enregistrement PADA
- * Correction : ICL de contexte transmis depuis TAL → tri par proximité
- * Module Zera haMakom™ : ZM-DEV-001
- *
- * Q = f(I, C, T, A, R, Z)
+ * HSC™ construit le droit séquentiel · Qavanah™ garde ce droit
+ * Q = f(I, C, T, A, R, Z, S) · S = Sequence Contract™
  *
  * DÉCISIONS v0.4.0 · LOI COA :
  *
@@ -230,13 +228,14 @@ function getActionFamily(actionType) {
 // ─── BASE DE DONNÉES ─────────────────────────────────────────────────────────
 let db = null;
 let inMemoryStore = {
-  trajectories:      {},
-  intent_anchors:    {},
-  context_snapshots: {},
-  proposed_actions:  {},
-  decisions:         {},
-  place_seeds:       {},
-  events:            []
+  trajectories:       {},
+  intent_anchors:     {},
+  context_snapshots:  {},
+  proposed_actions:   {},
+  decisions:          {},
+  place_seeds:        {},
+  sequence_contracts: {},   // ← HSC Registry · Phase 1
+  events:             []
 };
 
 if (process.env.DATABASE_URL) {
@@ -655,13 +654,21 @@ function buildZeraSeed({ icl, lat, lon, territory, place, voies, relations, obse
 
 app.get('/health', (req, res) => {
   res.json({
-    service:   'qavanah-api', status: 'ok', version: '0.6.2',
+    service:   'qavanah-api', status: 'ok', version: '0.7.0',
     mode:      QAVANAH_MODE, etape: 15,
     modules:   ['kernel','trajectory','intent','context','action',
                 'rule-engine','decision-engine','event-log',
                 'zera-hamakom','alignment-scoring','coa-trajectory',
                 'reanchor-coa-reset','tal-hybrid','pada-adapter',
-                'coa-window-manager','ayin-hamakom-loop'],
+                'coa-window-manager','ayin-hamakom-loop',
+                'hsc-registry'],
+    hsc: {
+      registry:      'qav_sequence_contracts',
+      seed:          'SEQ-SEARCH-PLACE-001 v1.0 · ACTIVE',
+      endpoints:     ['POST /v1/sequences', 'GET /v1/sequences/:id', 'GET /v1/sequences', 'PATCH /v1/sequences/:id/status'],
+      law:           'HSC construit · Qavanah garde · TAL manifeste · Ayin observe',
+      formula:       'Q = f(I, C, T, A, R, Z, S)'
+    },
     pada: {
       mode:      PADA_API_URL ? 'REAL' : 'SIMULATED',
       url:       PADA_API_URL ? 'configured' : 'absent',
@@ -1441,6 +1448,240 @@ app.post('/v1/ayin/integrate', async (req, res) => {
   });
 });
 
+// ── HSC REGISTRY · Phase 1 ───────────────────────────────────────────────────
+// HSC-INT-DEV-001 · Sequence Contract™ · mémoire constitutive commune
+// HSC construit le droit séquentiel · Qavanah garde ce droit
+//
+// Loi : une séquence ambiguë ou incomplète ne devient jamais ACTIVE
+// Loi : HSC ne doit jamais inventer l'antérieur
+// Loi : mode compilation uniquement · pas appelé à chaque requête
+
+function computeChecksum(contract) {
+  const crypto = require('crypto');
+  const data = JSON.stringify({
+    sequence_id:   contract.sequence_id,
+    version:       contract.version,
+    states:        contract.states,
+    transitions:   contract.transitions,
+    preconditions: contract.preconditions,
+    manifestation: contract.manifestation
+  });
+  return crypto.createHash('sha256').update(data).digest('hex').substring(0, 16);
+}
+
+function validateContract(contract) {
+  const errors = [];
+
+  if (!contract.sequence_id) errors.push('SEQUENCE_ID_REQUIRED');
+  if (!contract.version)     errors.push('VERSION_REQUIRED');
+  if (!Array.isArray(contract.states) || contract.states.length < 2)
+    errors.push('STATES_MINIMUM_2');
+
+  // Vérifier que START existe
+  if (contract.states && !contract.states.includes('START'))
+    errors.push('STATES_MISSING_START');
+
+  // Vérifier la non-inversion : chaque transition doit pointer vers un état connu
+  if (contract.transitions && Array.isArray(contract.transitions)) {
+    for (const t of contract.transitions) {
+      if (!contract.states.includes(t.from)) errors.push(`TRANSITION_UNKNOWN_FROM:${t.from}`);
+      if (!contract.states.includes(t.to))   errors.push(`TRANSITION_UNKNOWN_TO:${t.to}`);
+    }
+  }
+
+  return errors;
+}
+
+// POST /v1/sequences · Enregistrer un Sequence Contract™
+app.post('/v1/sequences', async (req, res) => {
+  const {
+    sequence_id, version = '1.0',
+    problem_id = null, law_id = null, hoq_id = null,
+    states = [], preconditions = {}, transitions = [],
+    manifestation = {}, status = 'DRAFT'
+  } = req.body;
+
+  if (!sequence_id) {
+    return res.status(400).json({ error: 'SEQUENCE_ID_REQUIRED' });
+  }
+
+  // Validation structurelle (HSC ne doit jamais laisser passer une séquence incomplète)
+  const errors = validateContract({ sequence_id, version, states, transitions, preconditions, manifestation });
+  if (errors.length > 0 && status === 'ACTIVE') {
+    return res.status(400).json({
+      error:  'INVALID_SEQUENCE',
+      status: 'REJECTED',
+      errors,
+      law:    'HSC-INT-DEV-001 §14 : une séquence incomplète ne devient jamais ACTIVE'
+    });
+  }
+
+  const createdAt = now();
+  const contract = {
+    sequence_id, version,
+    problem_id, law_id, hoq_id,
+    states, preconditions, transitions, manifestation,
+    status: errors.length > 0 ? 'DRAFT' : status,
+    created_at: createdAt,
+    checksum:   computeChecksum({ sequence_id, version, states, transitions, preconditions, manifestation })
+  };
+
+  // Persister en mémoire
+  inMemoryStore.sequence_contracts[sequence_id] = contract;
+
+  // Persister en PostgreSQL
+  if (db) {
+    try {
+      await db.query(
+        `INSERT INTO qav_sequence_contracts
+         (sequence_id, version, problem_id, law_id, hoq_id,
+          states, preconditions, transitions, manifestation,
+          status, created_at, checksum)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         ON CONFLICT (sequence_id) DO UPDATE SET
+           version=EXCLUDED.version, status=EXCLUDED.status,
+           states=EXCLUDED.states, transitions=EXCLUDED.transitions,
+           preconditions=EXCLUDED.preconditions,
+           manifestation=EXCLUDED.manifestation,
+           checksum=EXCLUDED.checksum`,
+        [sequence_id, version, problem_id, law_id, hoq_id,
+         JSON.stringify(states), JSON.stringify(preconditions),
+         JSON.stringify(transitions), JSON.stringify(manifestation),
+         contract.status, createdAt, contract.checksum]
+      );
+    } catch (e) {
+      console.error('[HSC-REGISTRY] DB error :', e.message);
+    }
+  }
+
+  await logEvent('SequenceContractRegistered', {
+    sequence_id, version, status: contract.status, checksum: contract.checksum
+  });
+
+  res.status(201).json({
+    contract,
+    registered: true,
+    validation: errors.length > 0 ? { warnings: errors } : { valid: true }
+  });
+});
+
+// GET /v1/sequences/:id · Lire un Sequence Contract™
+app.get('/v1/sequences/:id', async (req, res) => {
+  const { id } = req.params;
+
+  if (db) {
+    try {
+      const r = await db.query(
+        'SELECT * FROM qav_sequence_contracts WHERE sequence_id = $1', [id]
+      );
+      if (r.rows.length > 0) {
+        const row = r.rows[0];
+        return res.json({
+          contract: {
+            ...row,
+            states:        row.states,
+            preconditions: row.preconditions,
+            transitions:   row.transitions,
+            manifestation: row.manifestation
+          }
+        });
+      }
+    } catch (e) {
+      console.error('[HSC-REGISTRY] DB read error :', e.message);
+    }
+  }
+
+  const contract = inMemoryStore.sequence_contracts[id];
+  if (!contract) {
+    return res.status(404).json({
+      error: 'SEQUENCE_NOT_FOUND',
+      id,
+      hint: 'POST /v1/sequences pour enregistrer un Sequence Contract™'
+    });
+  }
+
+  res.json({ contract });
+});
+
+// GET /v1/sequences · Lister tous les contrats
+app.get('/v1/sequences', async (req, res) => {
+  const { status } = req.query;
+
+  if (db) {
+    try {
+      const query = status
+        ? 'SELECT sequence_id, version, status, problem_id, law_id, hoq_id, created_at, checksum FROM qav_sequence_contracts WHERE status = $1 ORDER BY created_at DESC'
+        : 'SELECT sequence_id, version, status, problem_id, law_id, hoq_id, created_at, checksum FROM qav_sequence_contracts ORDER BY created_at DESC';
+      const params = status ? [status] : [];
+      const r = await db.query(query, params);
+      return res.json({ contracts: r.rows, total: r.rows.length });
+    } catch (e) {
+      console.error('[HSC-REGISTRY] DB list error :', e.message);
+    }
+  }
+
+  const contracts = Object.values(inMemoryStore.sequence_contracts)
+    .filter(c => !status || c.status === status)
+    .map(c => ({
+      sequence_id: c.sequence_id, version: c.version, status: c.status,
+      problem_id: c.problem_id, law_id: c.law_id, hoq_id: c.hoq_id,
+      created_at: c.created_at, checksum: c.checksum
+    }));
+
+  res.json({ contracts, total: contracts.length });
+});
+
+// PATCH /v1/sequences/:id/status · Changer le statut d'un contrat
+app.patch('/v1/sequences/:id/status', async (req, res) => {
+  const { id }    = req.params;
+  const { status } = req.body;
+
+  const VALID_STATUSES = ['DRAFT', 'VALIDATED', 'ACTIVE', 'DEPRECATED', 'REJECTED'];
+  if (!VALID_STATUSES.includes(status)) {
+    return res.status(400).json({
+      error:  'INVALID_STATUS',
+      valid:  VALID_STATUSES
+    });
+  }
+
+  const contract = inMemoryStore.sequence_contracts[id];
+  if (!contract) {
+    return res.status(404).json({ error: 'SEQUENCE_NOT_FOUND' });
+  }
+
+  // Règle : ne peut devenir ACTIVE que si validation structurelle passe
+  if (status === 'ACTIVE') {
+    const errors = validateContract(contract);
+    if (errors.length > 0) {
+      return res.status(400).json({
+        error:  'CANNOT_ACTIVATE',
+        errors,
+        law:    'HSC-INT-DEV-001 §14'
+      });
+    }
+  }
+
+  const previousStatus = contract.status;
+  contract.status = status;
+
+  if (db) {
+    try {
+      await db.query(
+        'UPDATE qav_sequence_contracts SET status = $1 WHERE sequence_id = $2',
+        [status, id]
+      );
+    } catch (e) {
+      console.error('[HSC-REGISTRY] DB update error :', e.message);
+    }
+  }
+
+  await logEvent('SequenceContractStatusChanged', {
+    sequence_id: id, previousStatus, newStatus: status
+  });
+
+  res.json({ sequence_id: id, previousStatus, status, updated: true });
+});
+
 // ── INIT DB ───────────────────────────────────────────────────────────────────
 async function initDb() {
   if (!db) return;
@@ -1496,8 +1737,86 @@ async function initDb() {
       );
       ALTER TABLE qav_context_snapshots ADD COLUMN IF NOT EXISTS zera JSONB DEFAULT NULL;
       ALTER TABLE qav_decisions ADD COLUMN IF NOT EXISTS signals JSONB DEFAULT '{}';
+
+      CREATE TABLE IF NOT EXISTS qav_sequence_contracts (
+        sequence_id   TEXT PRIMARY KEY,
+        version       TEXT NOT NULL DEFAULT '1.0',
+        problem_id    TEXT,
+        law_id        TEXT,
+        hoq_id        TEXT,
+        states        JSONB DEFAULT '[]',
+        preconditions JSONB DEFAULT '{}',
+        transitions   JSONB DEFAULT '[]',
+        manifestation JSONB DEFAULT '{}',
+        status        TEXT DEFAULT 'DRAFT',
+        created_at    TIMESTAMPTZ DEFAULT NOW(),
+        checksum      TEXT
+      );
     `);
-    console.log('[QAVANAH] Tables vérifiées / créées v0.3.0');
+    console.log('[QAVANAH] Tables vérifiées / créées v0.7.0 · incl. qav_sequence_contracts');
+
+    // ── SEED · Premier Sequence Contract™ · SEQ-SEARCH-PLACE-001 ─────────────
+    // HSC-INT-DEV-001 §10 · Premier cas Or-Waffan™ · RUE TANO ATCHIMON
+    // Compilé depuis la généalogie : PROBLÈME → LOI → HOQ → SÉQUENCE
+    const seqCheck = await client.query(
+      "SELECT sequence_id FROM qav_sequence_contracts WHERE sequence_id = 'SEQ-SEARCH-PLACE-001'"
+    );
+
+    if (seqCheck.rows.length === 0) {
+      const seq = {
+        sequence_id: 'SEQ-SEARCH-PLACE-001',
+        version:     '1.0',
+        problem_id:  'PROB-OR-HABAYIT-001',  // Or haBayit ne connaît pas la voie proche
+        law_id:      'BH-159',               // Le Lieu précède le Souffle
+        hoq_id:      'BH-163',               // Lieu → Contexte → Parole → Forme : séquence irréversible
+        states:      ['START','RESOLVE_ICL','CAPTURE_CONTEXT','SEARCH_PLACE','RESOLVE_RESULT','SHOW_PLACE'],
+        preconditions: {
+          RESOLVE_ICL:     ['GPS_AVAILABLE'],
+          CAPTURE_CONTEXT: ['ICL_RESOLVED'],
+          SEARCH_PLACE:    ['CONTEXT_CAPTURED'],
+          RESOLVE_RESULT:  ['SEARCH_EXECUTED'],
+          SHOW_PLACE:      ['RESULT_RESOLVED']
+        },
+        transitions: [
+          { from: 'START',          to: 'RESOLVE_ICL',     action: 'GPS_TO_ICL',      requires: ['GPS_AVAILABLE'] },
+          { from: 'RESOLVE_ICL',    to: 'CAPTURE_CONTEXT', action: 'BUILD_CONTEXT',   requires: ['ICL_RESOLVED'] },
+          { from: 'CAPTURE_CONTEXT',to: 'SEARCH_PLACE',    action: 'SEARCH_PLACE',    requires: ['CONTEXT_CAPTURED'] },
+          { from: 'SEARCH_PLACE',   to: 'RESOLVE_RESULT',  action: 'RESOLVE_RESULT',  requires: ['SEARCH_EXECUTED'] },
+          { from: 'RESOLVE_RESULT', to: 'SHOW_PLACE',      action: 'SHOW_PLACE',      requires: ['RESULT_RESOLVED'] }
+        ],
+        manifestation: { type: 'SHOW_PLACE', tal_action: 'HIGHLIGHT_PLACE' },
+        status:    'ACTIVE',
+        created_at: now(),
+        checksum:  'seed-v1.0'
+      };
+
+      await client.query(
+        `INSERT INTO qav_sequence_contracts
+         (sequence_id, version, problem_id, law_id, hoq_id,
+          states, preconditions, transitions, manifestation,
+          status, created_at, checksum)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [seq.sequence_id, seq.version, seq.problem_id, seq.law_id, seq.hoq_id,
+         JSON.stringify(seq.states), JSON.stringify(seq.preconditions),
+         JSON.stringify(seq.transitions), JSON.stringify(seq.manifestation),
+         seq.status, seq.created_at, seq.checksum]
+      );
+
+      // Charger en mémoire
+      inMemoryStore.sequence_contracts[seq.sequence_id] = seq;
+      console.log('[HSC-REGISTRY] SEQ-SEARCH-PLACE-001 v1.0 · ACTIVE · seedé');
+    } else {
+      console.log('[HSC-REGISTRY] SEQ-SEARCH-PLACE-001 déjà présent');
+      // Charger depuis DB en mémoire
+      const row = seqCheck.rows[0];
+      const fullRow = await client.query(
+        'SELECT * FROM qav_sequence_contracts WHERE sequence_id = $1',
+        ['SEQ-SEARCH-PLACE-001']
+      );
+      if (fullRow.rows.length > 0) {
+        inMemoryStore.sequence_contracts['SEQ-SEARCH-PLACE-001'] = fullRow.rows[0];
+      }
+    }
   } finally { client.release(); }
 }
 
@@ -1506,11 +1825,11 @@ initDb().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════╗');
-    console.log('║   QAVANAH API™ v0.6.2 · Le Gardien de Trajectoire   ║');
+    console.log('║   QAVANAH API™ v0.7.0 · Le Gardien de Trajectoire   ║');
     console.log('║   Makom Intelligence™ · CorreIA LLC                  ║');
     console.log(`║   Port : ${PORT}  ·  Mode : ${QAVANAH_MODE.padEnd(7)}                    ║`);
-    console.log(`║   PADA : ${(PADA_API_URL ? 'REAL · tri proximité ICL' : 'SIMULATED').padEnd(43)}║`);
-    console.log('║   v0.6.2 · SEARCH_PLACE → contextIcl → tri PADA    ║');
+    console.log('║   HSC Registry · qav_sequence_contracts              ║');
+    console.log('║   SEQ-SEARCH-PLACE-001 v1.0 · ACTIVE · seedé        ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
   });
