@@ -1313,19 +1313,37 @@ app.post('/v1/tal/execute', async (req, res) => {
   // Récupérer la décision depuis le store
   const decision = decisionId ? inMemoryStore.decisions[decisionId] : null;
 
-  if (decisionId && decision && decision.decision !== 'ALLOW') {
-    await logEvent('TALBlocked', {
-      trajectoryId, decisionId, actionId,
-      reason: `DECISION_WAS_${decision.decision}_NOT_ALLOW`
-    });
-    return res.status(403).json({
-      error:      'TAL_BLOCKED',
-      reason:     `La décision ${decisionId} est ${decision.decision} · pas ALLOW`,
-      law:        'BH-384 · BH-390 · Autorisation préalable obligatoire',
-      decisionId,
-      expected:   'ALLOW',
-      received:   decision ? decision.decision : 'NOT_FOUND'
-    });
+  if (decisionId) {
+    // Cas 1 · decisionId fourni mais décision introuvable → PREMATURE_EXECUTION
+    if (!decision) {
+      await logEvent('TALBlocked', {
+        trajectoryId, decisionId, actionId,
+        reason: 'AUTHORIZATION_NOT_FOUND'
+      });
+      return res.status(403).json({
+        error:      'TAL_BLOCKED',
+        reason:     'AUTHORIZATION_NOT_FOUND · token introuvable ou expiré',
+        law:        'BH-384 · Autorisation préalable obligatoire',
+        decisionId,
+        expected:   'ALLOW',
+        received:   'NOT_FOUND'
+      });
+    }
+    // Cas 2 · décision trouvée mais pas ALLOW
+    if (decision.decision !== 'ALLOW') {
+      await logEvent('TALBlocked', {
+        trajectoryId, decisionId, actionId,
+        reason: `DECISION_WAS_${decision.decision}_NOT_ALLOW`
+      });
+      return res.status(403).json({
+        error:      'TAL_BLOCKED',
+        reason:     `La décision ${decisionId} est ${decision.decision} · pas ALLOW`,
+        law:        'BH-384 · BH-390 · Autorisation préalable obligatoire',
+        decisionId,
+        expected:   'ALLOW',
+        received:   decision.decision
+      });
+    }
   }
 
   if (!action || !action.type) {
