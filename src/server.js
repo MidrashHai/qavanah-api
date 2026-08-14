@@ -1,12 +1,19 @@
 /**
  * QAVANAH API™ - Le Gardien de Trajectoire
  * Makom Intelligence™ · CorreIA LLC
- * Version : 0.5.0
- * Date : 2026-08-13
- * Correction : Étape 12 · RE-ANCHOR avec reset COA · Ancre v1 obligatoire
- *              Étape 13 · TAL simulé · POST /v1/tal/execute
+ * Version : 0.6.0
+ * Date : 2026-08-14
+ * Correction : Priority 1 · Reset COA · Séparation RE-ANCHOR / COA WINDOW / HISTORY
+ *              Décision C : RE-ANCHOR auto-reset + POST /reset-coa indépendant
+ *              Étape 14 · ACTION_RESULT enrichi · Ayin loop
  *
- * Étapes couvertes : 0→13
+ * Étapes couvertes : 0→14
+ *
+ * DÉCISION v0.6.0 · RESET COA :
+ * Reset ≠ Delete. Reset change la fenêtre active · pas la mémoire du système.
+ * Trigger : RE_ANCHOR (auto) | OPERATOR (explicite) | EXTERNAL_VALIDATION
+ * Chaque reset produit un événement d'audit COAWindowReset immuable.
+ * Fenêtre précédente archivée dans coa_archive_{trajectoryId}_w{windowNumber}
  * Module Zera haMakom™ : ZM-DEV-001
  *
  * Q = f(I, C, T, A, R, Z)
@@ -324,6 +331,80 @@ function appendTension(trajectoryId, tension) {
   return series;
 }
 
+// ─── RESET COA WINDOW ────────────────────────────────────────────────────────
+// Décision v0.6.0 · Choix C
+// Reset ≠ Delete · reset change la fenêtre active · pas l'historique
+// Trigger : RE_ANCHOR (auto) | OPERATOR (explicite) | EXTERNAL_VALIDATION
+// Événement d'audit COAWindowReset immuable à chaque reset
+
+function getWindowNumber(trajectoryId) {
+  const archives = Object.keys(inMemoryStore)
+    .filter(k => k.startsWith(`coa_archive_${trajectoryId}_w`));
+  return archives.length + 1; // window suivante
+}
+
+async function resetCOAWindow({ trajectoryId, reason, trigger, actor }) {
+  const currentKey    = `coa_series_${trajectoryId}`;
+  const currentSeries = inMemoryStore[currentKey] || [];
+  const windowNumber  = getWindowNumber(trajectoryId);
+  const archiveKey    = `coa_archive_${trajectoryId}_w${windowNumber}`;
+
+  // Calculer l'état final de la fenêtre sortante
+  const lastTension   = currentSeries.length > 0 ? currentSeries[currentSeries.length - 1] : null;
+  const finalSlope    = computeSlope(currentSeries);
+  const finalAUC      = computeAUC(currentSeries);
+  const finalState    = currentSeries.length > 0
+    ? computeDriftState(lastTension, finalSlope, finalAUC)
+    : 'NORMAL';
+
+  // Archiver la fenêtre précédente (immuable)
+  inMemoryStore[archiveKey] = {
+    windowId:        archiveKey,
+    windowNumber,
+    trajectoryId,
+    series:          currentSeries,
+    steps:           currentSeries.length,
+    finalTension:    lastTension,
+    finalSlope,
+    finalAUC,
+    finalState,
+    archivedAt:      now(),
+    reason,
+    trigger,
+    actor:           actor || 'system'
+  };
+
+  // Ouvrir nouvelle fenêtre active = [0]
+  inMemoryStore[currentKey] = [0];
+
+  // Événement d'audit immuable
+  await logEvent('COAWindowReset', {
+    trajectoryId,
+    previousWindowId:   archiveKey,
+    newWindowId:        `coa_series_${trajectoryId}`,
+    windowNumber:       windowNumber + 1,
+    reason,
+    trigger,
+    actor:              actor || 'system',
+    previousState:      finalState,
+    previousAUC:        finalAUC,
+    newSeries:          [0],
+    timestamp:          now()
+  });
+
+  return {
+    reset:           true,
+    previousWindowId: archiveKey,
+    previousState:   finalState,
+    previousAUC:     finalAUC,
+    previousSteps:   currentSeries.length,
+    newWindowNumber: windowNumber + 1,
+    newSeries:       [0],
+    trigger,
+    reason
+  };
+}
+
 // ─── MOTEUR DÉTERMINISTE ─────────────────────────────────────────────────────
 // Étape 6 · opère AVANT les scores · BH-384
 
@@ -418,20 +499,19 @@ function buildZeraSeed({ icl, lat, lon, territory, place, voies, relations, obse
 
 app.get('/health', (req, res) => {
   res.json({
-    service:   'qavanah-api', status: 'ok', version: '0.5.0',
-    mode:      QAVANAH_MODE, etape: 13,
+    service:   'qavanah-api', status: 'ok', version: '0.6.0',
+    mode:      QAVANAH_MODE, etape: 14,
     modules:   ['kernel','trajectory','intent','context','action',
                 'rule-engine','decision-engine','event-log',
                 'zera-hamakom','alignment-scoring','coa-trajectory',
-                'reanchor-coa-reset','tal-simulated'],
-    coa: {
-      composite:          'intent×0.4 + context×0.3 + action×0.2 + zera×0.1',
-      tension:            '(1.0 - composite) × 1000',
-      reference:          1.0,
-      thresholds:         COA_THRESHOLDS,
-      weights_status:     'experimental · calibrage_requis',
-      blocking:           false,
-      note:               'OBSERVE · no automatic blocking'
+                'reanchor-coa-reset','tal-simulated',
+                'coa-window-manager','ayin-hamakom-loop'],
+    coa_windows: {
+      separation: 'RE-ANCHOR / COA_WINDOW / HISTORY',
+      reset_triggers: ['RE_ANCHOR','OPERATOR','EXTERNAL_VALIDATION'],
+      reset_reason: 'required',
+      archive: 'immutable',
+      note: 'Reset ≠ Delete · fenêtre active / historique global'
     },
     db: db ? 'postgresql' : 'in-memory', timestamp: now()
   });
@@ -439,22 +519,25 @@ app.get('/health', (req, res) => {
 
 app.get('/version', (req, res) => {
   res.json({
-    service: 'qavanah-api', version: '0.5.0',
+    service: 'qavanah-api', version: '0.6.0',
     codex: 'QAV-0001', devops: 'QAV-DEV-001',
     zera: 'ZM-DEV-001', raqia: 'QAV-RAQIA-001', hoqim: 'QAV-HOQ-001',
     mode: QAVANAH_MODE,
     formula: 'Q = f(I, C, T, A, R, Z)',
-    coa_v0_4_0: {
-      composite:  'intent×0.4 + context×0.3 + action×0.2 + zera×0.1',
-      tension:    '(1.0 - composite) × 1000',
-      slope:      'tensionSeries[n] - tensionSeries[n-1]',
-      auc:        'somme trapézoïdale de la série',
-      drift:      'NORMAL → WARNING → DRIFT',
-      thresholds: COA_THRESHOLDS,
-      blocking:   false
+    decision_c_v0_6_0: {
+      re_anchor:    'auto reset COA window · archive immutable',
+      reset_coa:    'POST /v1/trajectories/:id/reset-coa · reason required',
+      triggers:     ['RE_ANCHOR','OPERATOR','EXTERNAL_VALIDATION'],
+      separation:   'RE-ANCHOR ≠ COA_WINDOW ≠ HISTORY'
     },
-    etapesCouvertes: [0,1,2,3,4,5,6,7,8,'ZM',9,10],
-    releasedAt: '2026-08-13'
+    etape14: {
+      endpoint:  'POST /v1/ayin/integrate',
+      input:     'ACTION_RESULT',
+      output:    'ContextSnapshot N+1',
+      loop:      'PERCEPTION → ACTION → RESULT → CONTEXT_N+1 → PERCEPTION'
+    },
+    etapesCouvertes: [0,1,2,3,4,5,6,7,8,'ZM',9,10,12,13,14],
+    releasedAt: '2026-08-14'
   });
 });
 
@@ -877,29 +960,14 @@ app.post('/v1/intents/:contractId/reanchor', async (req, res) => {
 
   inMemoryStore.intent_anchors[anchorId] = anchor;
 
-  // Reset COA : archiver la série passée · ouvrir série_v2 = [0]
+  // Reset COA : archiver la série passée · ouvrir nouvelle fenêtre (Décision C)
+  let coaResetResult = null;
   if (trajectoryId) {
-    const currentKey  = `coa_series_${trajectoryId}`;
-    const archiveKey  = `coa_archive_${trajectoryId}_v${existing.version}`;
-    const currentSeries = inMemoryStore[currentKey] || [];
-
-    // Archiver la série passée
-    inMemoryStore[archiveKey] = {
-      series:    currentSeries,
-      anchorVersion: existing.version,
-      archivedAt: now(),
-      reason:    reason || 'USER_CHANGED_INTENT'
-    };
-
-    // Ouvrir nouvelle série à [0]
-    inMemoryStore[currentKey] = [0];
-
-    await logEvent('COASeriesReset', {
+    coaResetResult = await resetCOAWindow({
       trajectoryId,
-      previousVersion: existing.version,
-      newVersion,
-      archivedSeries: currentSeries,
-      archiveKey
+      reason: reason || 'USER_CHANGED_INTENT',
+      trigger: 'RE_ANCHOR',
+      actor: 'system'
     });
   }
 
@@ -913,12 +981,7 @@ app.post('/v1/intents/:contractId/reanchor', async (req, res) => {
     intentAnchor:    anchor,
     event:           'RE-ANCHOR',
     previousVersion: existing.version,
-    coa: {
-      reset:          true,
-      newSeries:      [0],
-      archivedVersion: existing.version,
-      note:           'COA_SERIES_RESET · nouvelle fenêtre de mesure ouverte'
-    }
+    coa: coaResetResult || { reset: false, note: 'trajectoryId absent' }
   });
 });
 
@@ -1061,6 +1124,130 @@ app.get('/v1/trajectories/:id/coa-archives', (req, res) => {
   res.json({ trajectoryId: id, currentSeries, archives });
 });
 
+// ── POST /v1/trajectories/:id/reset-coa · Reset explicite (Décision C) ───────
+// Trigger : OPERATOR | EXTERNAL_VALIDATION
+// reason obligatoire · événement d'audit immuable
+
+app.post('/v1/trajectories/:id/reset-coa', async (req, res) => {
+  const { id } = req.params;
+  const { reason, actor } = req.body;
+
+  if (!reason) {
+    return res.status(400).json({
+      error:  'REASON_REQUIRED',
+      law:    'Décision C v0.6.0 · reason obligatoire pour tout reset explicite',
+      hint:   '{ "reason": "new_observation_window" }'
+    });
+  }
+
+  const coaResult = await resetCOAWindow({
+    trajectoryId: id,
+    reason,
+    trigger: 'OPERATOR',
+    actor:   actor || 'operator'
+  });
+
+  res.json({
+    trajectoryId: id,
+    event:        'COA_WINDOW_RESET',
+    trigger:      'OPERATOR',
+    ...coaResult
+  });
+});
+
+// GET archives COA complètes (toutes fenêtres)
+app.get('/v1/trajectories/:id/coa-archives', (req, res) => {
+  const { id } = req.params;
+  const archives = Object.entries(inMemoryStore)
+    .filter(([k]) => k.startsWith(`coa_archive_${id}_w`))
+    .map(([, v]) => v)
+    .sort((a, b) => a.windowNumber - b.windowNumber);
+  const currentSeries = getTensionSeries(id);
+  const currentSlope  = computeSlope(currentSeries);
+  const currentAUC    = computeAUC(currentSeries);
+  const currentState  = currentSeries.length > 0
+    ? computeDriftState(currentSeries[currentSeries.length-1], currentSlope, currentAUC)
+    : 'NORMAL';
+
+  res.json({
+    trajectoryId:  id,
+    totalWindows:  archives.length + 1,
+    activeWindow: {
+      windowId:    `coa_series_${id}`,
+      series:      currentSeries,
+      steps:       currentSeries.length,
+      tension:     currentSeries.length > 0 ? currentSeries[currentSeries.length-1] : null,
+      slope:       currentSlope,
+      auc:         currentAUC,
+      state:       currentState
+    },
+    archivedWindows: archives
+  });
+});
+
+// ── ÉTAPE 14 · ACTION_RESULT enrichi · Boucle Ayin haMakom™ ──────────────────
+// Fermeture complète : ACTION_RESULT → contexte enrichi → prochain contrôle
+// BH-154 : Tout est spirale · rien ne se perd
+
+app.post('/v1/ayin/integrate', async (req, res) => {
+  const { trajectoryId, actionId, actionResult, icl } = req.body;
+
+  if (!actionResult) {
+    return res.status(400).json({ error: 'ACTION_RESULT_REQUIRED' });
+  }
+
+  const integrationId = generateId('AYN');
+  const integratedAt  = now();
+
+  // Construire le nouveau ContextSnapshot N+1
+  const newContextId = generateId('CTX');
+  const contextN1 = {
+    contextId:   newContextId,
+    trajectoryId,
+    icl:         icl || null,
+    source:      'AYIN_HAMAKOM_INTEGRATION',
+    actionId:    actionId || null,
+    actionResult,
+    integratedAt,
+    version:     'N+1',
+    frozen:      true,
+    place:   actionResult.result?.place || {},
+    state:   {
+      lastAction:   actionResult.type || null,
+      lastStatus:   actionResult.status,
+      lastFocus:    actionResult.result?.place?.icl || icl || null,
+      updatedAt:    integratedAt
+    }
+  };
+
+  // Persister le nouveau contexte
+  inMemoryStore.context_snapshots[newContextId] = contextN1;
+
+  await logEvent('ActionResultIntegrated', {
+    trajectoryId, actionId, integrationId,
+    newContextId,
+    icl: contextN1.state.lastFocus,
+    status: actionResult.status
+  });
+
+  await logEvent('AyinHaMakomUpdated', {
+    trajectoryId,
+    previousContext: null,
+    newContext: newContextId,
+    trigger: 'ACTION_RESULT'
+  });
+
+  res.json({
+    integrationId,
+    event:          'AYIN_HAMAKOM_UPDATED',
+    trajectoryId,
+    newContext:     contextN1,
+    next:           'QAVANAH_CHECK_WITH_NEW_CONTEXT',
+    loop:           'PERCEPTION → ACTION → RESULT → CONTEXT_N+1 → PERCEPTION',
+    note:           'Boucle fermée · prochain contrôle depuis le nouveau contexte'
+  });
+});
+
 // ── INIT DB ───────────────────────────────────────────────────────────────────
 async function initDb() {
   if (!db) return;
@@ -1126,11 +1313,11 @@ initDb().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════╗');
-    console.log('║   QAVANAH API™ v0.5.0 · Le Gardien de Trajectoire   ║');
+    console.log('║   QAVANAH API™ v0.6.0 · Le Gardien de Trajectoire   ║');
     console.log('║   Makom Intelligence™ · CorreIA LLC                  ║');
     console.log(`║   Port : ${PORT}  ·  Mode : ${QAVANAH_MODE.padEnd(7)}                    ║`);
-    console.log('║   Étapes 0→13 · RE-ANCHOR reset COA · TAL simulé   ║');
-    console.log('║   POST /v1/tal/execute · GET /coa-archives          ║');
+    console.log('║   Étapes 0→14 · COA Window Manager · Ayin Loop      ║');
+    console.log('║   POST /reset-coa · POST /ayin/integrate             ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
   });
