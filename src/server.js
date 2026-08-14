@@ -1,16 +1,13 @@
 /**
  * QAVANAH API™ - Le Gardien de Trajectoire
  * Makom Intelligence™ · CorreIA LLC
- * Version : 0.6.1
+ * Version : 0.6.2
  * Date : 2026-08-14
- * Correction : Étape 15 · Gardien de Données PADA réel · Architecture hybride
+ * Correction : SEARCH_PLACE transmet l'ICL de contexte · tri par proximité ICL
+ *              padaSearchPlace(query, contextIcl) → résultats triés
  *
- * DÉCISION v0.6.1 · HYBRIDE :
- * TAL appelle PADA réellement si PADA_API_URL définie · sinon simulation
- * execution_mode = REAL | SIMULATED · jamais silencieux
- * provider = PADA | SIMULATION · obligatoire dans tout ACTION_RESULT
- * Test REAL invalide si provider = SIMULATION
- * Qavanah Kernel = aucune dépendance PADA · séparation constitutive
+ * Observation TA-QAV-015 : ICL retourné = premier enregistrement PADA
+ * Correction : ICL de contexte transmis depuis TAL → tri par proximité
  * Module Zera haMakom™ : ZM-DEV-001
  *
  * Q = f(I, C, T, A, R, Z)
@@ -55,95 +52,93 @@ if (PADA_API_URL) {
   console.log('[QAVANAH] PADA Adapter : SIMULATED (PADA_API_URL absent)');
 }
 
-async function padaSearchPlace(query) {
+async function padaSearchPlace(query, contextIcl) {
   if (!PADA_API_URL) {
-    // Fallback simulation · affiché clairement
     return {
-      execution_mode: 'SIMULATED',
-      provider:       'SIMULATION',
-      found:          true,
+      execution_mode: 'SIMULATED', provider: 'SIMULATION',
+      found: true,
       place: {
-        name:    query,
-        icl:     '4331|2136',
-        address: `${query} · Cocody · Abidjan`,
-        source:  'SIMULATION'
+        name:    query, icl: contextIcl || '4331|2136',
+        address: `${query} · Cocody · Abidjan`, source: 'SIMULATION'
       }
     };
   }
 
-  // Appel réel vers api.omhai.eu
   try {
-    const http  = require('https');
-    const url   = `${PADA_API_URL}/v1/territoire`;
-    const data  = await new Promise((resolve, reject) => {
+    const http = require('https');
+    const url  = `${PADA_API_URL}/v1/territoire`;
+    const data = await new Promise((resolve, reject) => {
       const req = http.get(url, (res) => {
         let raw = '';
         res.on('data', d => raw += d);
-        res.on('end', () => {
-          try { resolve(JSON.parse(raw)); }
-          catch { reject(new Error('PARSE_ERROR')); }
-        });
+        res.on('end', () => { try { resolve(JSON.parse(raw)); } catch { reject(new Error('PARSE_ERROR')); } });
       });
       req.on('error', reject);
-      req.setTimeout(5000, () => {
-        req.destroy();
-        reject(new Error('TIMEOUT'));
-      });
+      req.setTimeout(8000, () => { req.destroy(); reject(new Error('TIMEOUT')); });
     });
 
-    // Chercher le lieu dans les données PADA
     const normalizedQuery = query.toUpperCase().trim();
-    let found = null;
+    const items = Array.isArray(data) ? data
+      : (data.features ? data.features.map(f => f.properties) : []);
 
-    if (Array.isArray(data)) {
-      found = data.find(item =>
+    // Trouver tous les enregistrements correspondant à la requête
+    const matches = items.filter(item =>
+      item && (
         (item.nom_voie && item.nom_voie.toUpperCase().includes(normalizedQuery)) ||
-        (item.st_name && item.st_name.toUpperCase().includes(normalizedQuery)) ||
-        (item.nom && item.nom.toUpperCase().includes(normalizedQuery))
-      );
-    } else if (data && data.features) {
-      // Format GeoJSON
-      const feat = data.features.find(f =>
-        f.properties && (
-          (f.properties.nom_voie && f.properties.nom_voie.toUpperCase().includes(normalizedQuery)) ||
-          (f.properties.st_name && f.properties.st_name.toUpperCase().includes(normalizedQuery))
-        )
-      );
-      if (feat) found = feat.properties;
+        (item.st_name  && item.st_name.toUpperCase().includes(normalizedQuery))  ||
+        (item.nom      && item.nom.toUpperCase().includes(normalizedQuery))
+      )
+    );
+
+    if (matches.length === 0) {
+      return {
+        execution_mode: 'REAL', provider: 'PADA',
+        found: false, status: 'NOT_FOUND', query, source: 'PADA_COCODY_REAL'
+      };
     }
 
-    if (found) {
-      return {
-        execution_mode: 'REAL',
-        provider:       'PADA',
-        found:          true,
-        place: {
-          name:       found.nom_voie || found.st_name || found.nom || query,
-          icl:        found.icl || found.icl_debut || null,
-          address:    `${found.nom_voie || found.st_name || query} · Cocody · Abidjan`,
-          source:     'PADA_COCODY_REAL',
-          raw:        found
-        }
-      };
-    } else {
-      return {
-        execution_mode: 'REAL',
-        provider:       'PADA',
-        found:          false,
-        status:         'NOT_FOUND',
-        query,
-        source:         'PADA_COCODY_REAL'
-      };
+    // Trier par proximité ICL si contextIcl fourni
+    // ICL format "AAAA | BBBB" → distance = |A1-A2| + |B1-B2|
+    let sorted = matches;
+    if (contextIcl) {
+      const [cA, cB] = contextIcl.replace(/\s/g, '').split('|').map(Number);
+      sorted = [...matches].sort((x, y) => {
+        const iclX = (x.icl || '0|0').replace(/\s/g, '').split('|').map(Number);
+        const iclY = (y.icl || '0|0').replace(/\s/g, '').split('|').map(Number);
+        const dX = Math.abs((iclX[0]||0) - cA) + Math.abs((iclX[1]||0) - cB);
+        const dY = Math.abs((iclY[0]||0) - cA) + Math.abs((iclY[1]||0) - cB);
+        return dX - dY;
+      });
     }
+
+    const best = sorted[0];
+    return {
+      execution_mode:   'REAL',
+      provider:         'PADA',
+      found:            true,
+      context_icl:      contextIcl || null,
+      total_matches:    matches.length,
+      proximity_sorted: !!contextIcl,
+      place: {
+        name:    best.nom_voie || best.st_name || best.nom || query,
+        icl:     best.icl || null,
+        numero:  best.numero || null,
+        address: `${best.nom_voie || best.st_name || query} · Cocody · Abidjan`,
+        source:  'PADA_COCODY_REAL',
+        raw:     best
+      },
+      alternatives: sorted.slice(1, 3).map(a => ({
+        name:   a.nom_voie || a.st_name || a.nom,
+        icl:    a.icl || null,
+        numero: a.numero || null
+      }))
+    };
   } catch (err) {
-    // Erreur réseau → fallback simulation avec flag d'erreur
     console.error('[PADA] Erreur appel réel :', err.message);
     return {
-      execution_mode:  'SIMULATED',
-      provider:        'SIMULATION',
+      execution_mode: 'SIMULATED', provider: 'SIMULATION',
       fallback_reason: `PADA_ERROR: ${err.message}`,
-      found:           false,
-      status:          'PADA_UNAVAILABLE'
+      found: false, status: 'PADA_UNAVAILABLE'
     };
   }
 }
@@ -660,7 +655,7 @@ function buildZeraSeed({ icl, lat, lon, territory, place, voies, relations, obse
 
 app.get('/health', (req, res) => {
   res.json({
-    service:   'qavanah-api', status: 'ok', version: '0.6.1',
+    service:   'qavanah-api', status: 'ok', version: '0.6.2',
     mode:      QAVANAH_MODE, etape: 15,
     modules:   ['kernel','trajectory','intent','context','action',
                 'rule-engine','decision-engine','event-log',
@@ -1185,13 +1180,13 @@ const TAL_SIMULATED_RESULTS = {
 };
 
 // Exécution TAL hybride : PADA Adapter pour SEARCH_* · simulation pour les autres
-async function executeTAL(action) {
+async function executeTAL(action, contextIcl) {
   const type   = action.type;
   const params = action.parameters || {};
 
-  // SEARCH_PLACE → PADA Adapter (REAL si possible)
+  // SEARCH_PLACE → PADA Adapter (REAL si possible) · tri par proximité ICL
   if (type === 'SEARCH_PLACE') {
-    return await padaSearchPlace(params.query || '');
+    return await padaSearchPlace(params.query || '', contextIcl || null);
   }
 
   // SEARCH_NUMBER → PADA Adapter (REAL si possible · Loi Non-invention)
@@ -1224,7 +1219,7 @@ async function executeTAL(action) {
 }
 
 app.post('/v1/tal/execute', async (req, res) => {
-  const { decisionId, actionId, action, trajectoryId } = req.body;
+  const { decisionId, actionId, action, trajectoryId, contextIcl } = req.body;
 
   // Vérification : l'action ne peut entrer dans le TAL que depuis un ALLOW
   // Récupérer la décision depuis le store
@@ -1249,8 +1244,8 @@ app.post('/v1/tal/execute', async (req, res) => {
     return res.status(400).json({ error: 'ACTION_TYPE_REQUIRED' });
   }
 
-  // Exécution hybride PADA Adapter (Étape 15)
-  const result    = await executeTAL(action);
+  // Exécution hybride PADA Adapter (Étape 15) · contextIcl pour tri proximité
+  const result    = await executeTAL(action, contextIcl || null);
   const executedAt = now();
 
   // Validation : test REAL invalide si provider = SIMULATION et PADA_API_URL définie
@@ -1511,11 +1506,11 @@ initDb().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════╗');
-    console.log('║   QAVANAH API™ v0.6.1 · Le Gardien de Trajectoire   ║');
+    console.log('║   QAVANAH API™ v0.6.2 · Le Gardien de Trajectoire   ║');
     console.log('║   Makom Intelligence™ · CorreIA LLC                  ║');
     console.log(`║   Port : ${PORT}  ·  Mode : ${QAVANAH_MODE.padEnd(7)}                    ║`);
-    console.log(`║   PADA : ${(PADA_API_URL ? 'REAL · ' + PADA_API_URL.substring(0,30) : 'SIMULATED (PADA_API_URL absent)').padEnd(43)}║`);
-    console.log('║   Étape 15 · PADA Adapter hybride                    ║');
+    console.log(`║   PADA : ${(PADA_API_URL ? 'REAL · tri proximité ICL' : 'SIMULATED').padEnd(43)}║`);
+    console.log('║   v0.6.2 · SEARCH_PLACE → contextIcl → tri PADA    ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
   });
