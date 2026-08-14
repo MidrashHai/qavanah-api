@@ -114,6 +114,16 @@ async function padaSearchPlace(query, contextIcl) {
     }
 
     const best = sorted[0];
+
+    // ── Métadonnées d'affichage cartographique · TAL frontend ─────────────
+    // Toutes les adresses de la voie trouvée · pour illumination collective
+    const voieName = best.nom_voie || best.st_name || best.nom || query;
+    const allAddresses = sorted.map(a => ({
+      icl:    a.icl    || null,
+      numero: a.numero || null,
+      name:   a.nom_voie || a.st_name || a.nom || voieName
+    }));
+
     return {
       execution_mode:   'REAL',
       provider:         'PADA',
@@ -122,10 +132,10 @@ async function padaSearchPlace(query, contextIcl) {
       total_matches:    matches.length,
       proximity_sorted: !!contextIcl,
       place: {
-        name:    best.nom_voie || best.st_name || best.nom || query,
+        name:    voieName,
         icl:     best.icl || null,
         numero:  best.numero || null,
-        address: `${best.nom_voie || best.st_name || query} · Cocody · Abidjan`,
+        address: `${voieName} · Cocody · Abidjan`,
         source:  'PADA_COCODY_REAL',
         raw:     best
       },
@@ -133,7 +143,20 @@ async function padaSearchPlace(query, contextIcl) {
         name:   a.nom_voie || a.st_name || a.nom,
         icl:    a.icl || null,
         numero: a.numero || null
-      }))
+      })),
+      // ── TAL cartographique · OmeH.ai frontend ────────────────────────────
+      // Ces métadonnées permettent au TAL d'illuminer toutes les adresses
+      // de la voie sur la carte · conformément au Parcours Client OmeH.ai
+      tal_map: {
+        action:           'HIGHLIGHT_ADDRESSES_BY_VOIE',
+        voie_name:        voieName,
+        addresses:        allAddresses,
+        addresses_count:  matches.length,
+        highlight_color:  'orange',
+        highlight_radius: 7,
+        fly_to:           true,
+        structure_f:      matches.length === 0  // hors périmètre si 0 résultats
+      }
     };
   } catch (err) {
     console.error('[PADA] Erreur appel réel :', err.message);
@@ -188,12 +211,44 @@ async function padaSearchNumber(query, params) {
       item && (item.numero === query || item.numero === parseInt(query))
     );
 
-    return found ? {
+    if (!found) {
+      return {
+        execution_mode: 'REAL', provider: 'PADA', found: false,
+        status: 'NOT_FOUND', law: 'NON_INVENTION',
+        tal_map: { action: 'STRUCTURE_F', structure_f: true }
+      };
+    }
+
+    // Trouver les voisins réels (numéros adjacents dans les données)
+    const numero = parseInt(query);
+    const neighbors = items
+      .filter(item => item && item.numero && Math.abs(parseInt(item.numero) - numero) <= 10
+                   && item.numero !== query && item.numero !== numero)
+      .sort((a, b) => Math.abs(parseInt(a.numero) - numero) - Math.abs(parseInt(b.numero) - numero))
+      .slice(0, 4)
+      .map(n => ({ icl: n.icl || null, numero: n.numero }));
+
+    return {
       execution_mode: 'REAL', provider: 'PADA', found: true,
-      number: query, address: found, source: 'PADA_COCODY_REAL'
-    } : {
-      execution_mode: 'REAL', provider: 'PADA', found: false,
-      status: 'NOT_FOUND', law: 'NON_INVENTION'
+      number: query, address: found, source: 'PADA_COCODY_REAL',
+      neighbors,
+      // ── TAL cartographique · OmeH.ai frontend ──────────────────────────
+      // Point cible grand · voisins jaune pâle · zoom 18
+      // Conformément au Parcours Client OmeH.ai Phase 5
+      tal_map: {
+        action:           'HIGHLIGHT_NUMBER',
+        target: {
+          icl:    found.icl    || null,
+          numero: found.numero || query,
+          highlight_color:  'orange',
+          highlight_radius: 11
+        },
+        neighbors:        neighbors,
+        neighbors_color:  'yellow',
+        neighbors_radius: 7,
+        fly_to:           true,
+        zoom_level:       18
+      }
     };
   } catch (err) {
     console.error('[PADA] Erreur numéro :', err.message);
