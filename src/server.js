@@ -1,14 +1,18 @@
 /**
  * QAVANAH API™ - Le Gardien de Trajectoire
  * Makom Intelligence™ · CorreIA LLC
- * Version : 0.7.0
+ * Version : 0.8.0
  * Date : 2026-08-14
- * Phase 1 · HSC Registry · qav_sequence_contracts
- *           POST /v1/sequences · GET /v1/sequences/:id
- *           INSERT SEQ-SEARCH-PLACE-001 v1.0
+ * Phase 2 · HSC Contract Binding · qav_sequence_states
+ *           Qavanah maintient l'état séquentiel par trajectoire
+ *           L'état n'avance qu'après ACTION_RESULT confirmé
  *
- * HSC™ construit le droit séquentiel · Qavanah™ garde ce droit
- * Q = f(I, C, T, A, R, Z, S) · S = Sequence Contract™
+ * RÈGLE CANONIQUE v0.8.0 :
+ * Qavanah ne fait pas confiance à l'état déclaré par l'agent.
+ * Qavanah maintient un état séquentiel persistant par trajectoire.
+ * L'état n'avance qu'après confirmation de la transition manifestée.
+ *
+ * Q = f(I, C, T, A, R, Z, S)
  *
  * DÉCISIONS v0.4.0 · LOI COA :
  *
@@ -235,6 +239,7 @@ let inMemoryStore = {
   decisions:          {},
   place_seeds:        {},
   sequence_contracts: {},   // ← HSC Registry · Phase 1
+  sequence_states:    {},   // ← HSC States · Phase 2 · état par trajectoire
   events:             []
 };
 
@@ -654,20 +659,20 @@ function buildZeraSeed({ icl, lat, lon, territory, place, voies, relations, obse
 
 app.get('/health', (req, res) => {
   res.json({
-    service:   'qavanah-api', status: 'ok', version: '0.7.0',
-    mode:      QAVANAH_MODE, etape: 15,
+    service:   'qavanah-api', status: 'ok', version: '0.8.0',
+    mode:      QAVANAH_MODE, etape: 16,
     modules:   ['kernel','trajectory','intent','context','action',
                 'rule-engine','decision-engine','event-log',
                 'zera-hamakom','alignment-scoring','coa-trajectory',
                 'reanchor-coa-reset','tal-hybrid','pada-adapter',
                 'coa-window-manager','ayin-hamakom-loop',
-                'hsc-registry'],
+                'hsc-registry','hsc-contract-binding'],
     hsc: {
-      registry:      'qav_sequence_contracts',
-      seed:          'SEQ-SEARCH-PLACE-001 v1.0 · ACTIVE',
-      endpoints:     ['POST /v1/sequences', 'GET /v1/sequences/:id', 'GET /v1/sequences', 'PATCH /v1/sequences/:id/status'],
-      law:           'HSC construit · Qavanah garde · TAL manifeste · Ayin observe',
-      formula:       'Q = f(I, C, T, A, R, Z, S)'
+      registry:    'qav_sequence_contracts',
+      states:      'qav_sequence_states',
+      seed:        'SEQ-SEARCH-PLACE-001 v1.0 · ACTIVE',
+      rule:        'État avance uniquement après ACTION_RESULT confirmé',
+      formula:     'Q = f(I, C, T, A, R, Z, S)'
     },
     pada: {
       mode:      PADA_API_URL ? 'REAL' : 'SIMULATED',
@@ -941,14 +946,72 @@ app.post('/v1/qavanah/check', async (req, res) => {
 
   const checkId = generateId('CHK'), checkedAt = now();
 
-  // ── Moteur Déterministe (Étape 6) ──────────────────────────────────────────
-  const ruleResult = runDeterministicEngine(intent, context, action);
-
   // ── Moteur d'Alignement (Étape 9) · scores réels ───────────────────────────
   const { scores, signals } = computeAlignmentScores(intent, context, action,
     context && context.zera ? context.zera : null);
 
-  // ── Moteur COA™ (Étape 10) · Tension / Slope / AUC ─────────────────────────
+  // ── HSC Contract Binding (Phase 2) ─────────────────────────────────────────
+  // Vérification séquentielle AVANT la décision finale
+  // Qavanah ne fait pas confiance à l'état déclaré par l'agent
+  let sequenceResult  = null;
+  let sequenceDecision = null;
+
+  const seqId   = action?.sequence_id || null;
+  const stepId  = action?.step_id     || action?.type || null;
+
+  if (seqId && stepId) {
+    const contract = await loadSequenceContract(seqId);
+
+    if (contract) {
+      // Charger ou initialiser l'état séquentiel de cette trajectoire
+      let seqState = await getSequenceState(trajectoryId, seqId);
+      if (!seqState) {
+        seqState = await initSequenceState(trajectoryId, seqId, contract);
+      }
+
+      const currentState = seqState.current_state;
+
+      // Vérifier la transition
+      const transitionCheck = checkTransition(contract, currentState, stepId);
+      sequenceResult = {
+        sequence_id:   seqId,
+        current_state: currentState,
+        proposed_step: stepId,
+        ...transitionCheck
+      };
+
+      if (!transitionCheck.valid) {
+        sequenceDecision = transitionCheck.decision; // BLOCK ou ADJUST
+      }
+
+      await logEvent('SequenceTransitionChecked', {
+        trajectoryId, sequence_id: seqId,
+        current_state: currentState,
+        proposed_step: stepId,
+        valid: transitionCheck.valid,
+        reason: transitionCheck.reason
+      });
+    } else {
+      sequenceResult = {
+        sequence_id: seqId,
+        error: 'CONTRACT_NOT_FOUND',
+        note:  'Action évaluée sans contrat séquentiel'
+      };
+    }
+  }
+
+  // ── Décision finale · Moteur Déterministe + HSC Contract Binding ────────────
+  // Priorité : HSC BLOCK > Déterministe > ALLOW
+  const ruleResult = runDeterministicEngine(intent, context, action);
+
+  // Si HSC dit BLOCK ou ADJUST · ça prime sur le moteur déterministe si celui-ci dit ALLOW
+  let finalDecision = ruleResult.decision;
+  let sequenceOverride = false;
+
+  if (sequenceDecision && sequenceDecision !== 'ALLOW' && ruleResult.decision === 'ALLOW') {
+    finalDecision    = sequenceDecision;
+    sequenceOverride = true;
+  }
   const compositeResult  = computeCompositeScore(scores);
   const tension          = computeTension(compositeResult.composite);
   const tensionSeries    = appendTension(trajectoryId, tension);
@@ -972,7 +1035,7 @@ app.post('/v1/qavanah/check', async (req, res) => {
   } : { present: false };
 
   const decisionPayload = {
-    checkId, decision: ruleResult.decision, trajectoryId,
+    checkId, decision: finalDecision, trajectoryId,
     actionId: action?.id || null, mode: QAVANAH_MODE,
 
     // Scores d'alignement réels (Étape 9)
@@ -997,6 +1060,15 @@ app.post('/v1/qavanah/check', async (req, res) => {
 
     zera: zeraRef,
 
+    // HSC Contract Binding (Phase 2)
+    sequence: sequenceResult ? {
+      ...sequenceResult,
+      override: sequenceOverride,
+      note:     sequenceOverride
+        ? `HSC override: ${sequenceResult.reason} → ${finalDecision}`
+        : 'HSC check applied'
+    } : null,
+
     // COA™ · Moteur de Trajectoire (Étape 10)
     // Mode OBSERVE : calculé · pas de blocage automatique (BH-068)
     drift: {
@@ -1012,21 +1084,27 @@ app.post('/v1/qavanah/check', async (req, res) => {
       note:             'MODE_OBSERVE · pas_de_blocage_automatique · calibrage_requis'
     },
 
-    authorization: { status: ruleResult.decision === 'ALLOW' ? 'AUTHORIZED' : 'REFUSED' },
+    authorization: { status: finalDecision === 'ALLOW' ? 'AUTHORIZED' : 'REFUSED' },
 
-    reasonCodes: ruleResult.reasonCodes,
-    evidence:    ruleResult.evidence,
+    reasonCodes: [
+      ...ruleResult.reasonCodes,
+      ...(sequenceResult && !sequenceResult.valid ? [`SEQ_${sequenceResult.reason}`] : [])
+    ],
+    evidence: [
+      ...ruleResult.evidence,
+      ...(sequenceResult?.valid ? [`SEQ_TRANSITION_VALID:${sequenceResult.current_state}→${sequenceResult.next_state}`] : [])
+    ],
 
-    next: ruleResult.decision === 'ALLOW' ? 'EXECUTE'
-        : ruleResult.decision === 'ADJUST' ? 'RECOMPUTE' : 'STOP',
+    next: finalDecision === 'ALLOW' ? 'EXECUTE'
+        : finalDecision === 'ADJUST' ? 'RECOMPUTE' : 'STOP',
 
     checkedAt
   };
 
   inMemoryStore.decisions[checkId] = { ...decisionPayload, input:{ trajectoryId, intent, context, agent, action } };
 
-  const eventType = ruleResult.decision === 'ALLOW' ? 'DecisionAllowed'
-    : ruleResult.decision === 'ADJUST' ? 'DecisionAdjusted' : 'DecisionBlocked';
+  const eventType = finalDecision === 'ALLOW' ? 'DecisionAllowed'
+    : finalDecision === 'ADJUST' ? 'DecisionAdjusted' : 'DecisionBlocked';
 
   // Log drift si signal détecté
   if (driftState !== 'NORMAL') {
@@ -1037,9 +1115,12 @@ app.post('/v1/qavanah/check', async (req, res) => {
     });
   }
 
-  await logEvent(eventType, { checkId, trajectoryId, decision:ruleResult.decision,
-    actionType:action?.type, alignment:scores, coa:{ tension, slope, auc, driftState } });
-  await logEvent('ActionChecked', { checkId, trajectoryId, actionType:action?.type });
+  await logEvent(eventType, { checkId, trajectoryId, decision: finalDecision,
+    actionType: action?.type, alignment: scores,
+    coa: { tension, slope, auc, driftState },
+    sequence: sequenceResult ? { id: seqId, step: stepId, valid: sequenceResult.valid } : null
+  });
+  await logEvent('ActionChecked', { checkId, trajectoryId, actionType: action?.type });
 
   res.json(decisionPayload);
 });
@@ -1682,6 +1763,272 @@ app.patch('/v1/sequences/:id/status', async (req, res) => {
   res.json({ sequence_id: id, previousStatus, status, updated: true });
 });
 
+// ── HSC CONTRACT BINDING · Phase 2 ──────────────────────────────────────────
+// Qavanah maintient l'état séquentiel persistant par trajectoire
+// L'état n'avance QU'APRÈS ACTION_RESULT confirmé · jamais sur ALLOW seul
+// Règle canonique : Qavanah ne fait pas confiance à l'état déclaré par l'agent
+
+// Charger un Sequence Contract depuis le Registry
+async function loadSequenceContract(sequence_id) {
+  if (!sequence_id) return null;
+
+  // Mémoire d'abord
+  if (inMemoryStore.sequence_contracts[sequence_id]) {
+    return inMemoryStore.sequence_contracts[sequence_id];
+  }
+
+  // PostgreSQL si absent en mémoire
+  if (db) {
+    try {
+      const r = await db.query(
+        'SELECT * FROM qav_sequence_contracts WHERE sequence_id = $1 AND status = $2',
+        [sequence_id, 'ACTIVE']
+      );
+      if (r.rows.length > 0) {
+        inMemoryStore.sequence_contracts[sequence_id] = r.rows[0];
+        return r.rows[0];
+      }
+    } catch (e) {
+      console.error('[HSC-BINDING] loadSequenceContract error:', e.message);
+    }
+  }
+
+  return null;
+}
+
+// Lire l'état séquentiel courant d'une trajectoire
+async function getSequenceState(trajectoryId, sequence_id) {
+  const key = `seq_state_${trajectoryId}_${sequence_id}`;
+
+  if (inMemoryStore.sequence_states[key]) {
+    return inMemoryStore.sequence_states[key];
+  }
+
+  if (db) {
+    try {
+      const r = await db.query(
+        'SELECT * FROM qav_sequence_states WHERE trajectory_id = $1 AND sequence_id = $2',
+        [trajectoryId, sequence_id]
+      );
+      if (r.rows.length > 0) {
+        inMemoryStore.sequence_states[key] = r.rows[0];
+        return r.rows[0];
+      }
+    } catch (e) {
+      console.error('[HSC-BINDING] getSequenceState error:', e.message);
+    }
+  }
+
+  return null;
+}
+
+// Initialiser l'état séquentiel d'une trajectoire (premier appel)
+async function initSequenceState(trajectoryId, sequence_id, contract) {
+  const key       = `seq_state_${trajectoryId}_${sequence_id}`;
+  const createdAt = now();
+  const state = {
+    trajectory_id:  trajectoryId,
+    sequence_id,
+    current_state:  'START',
+    previous_state: null,
+    last_action:    null,
+    steps_completed: 0,
+    created_at:     createdAt,
+    updated_at:     createdAt,
+    status:         'IN_PROGRESS'
+  };
+
+  inMemoryStore.sequence_states[key] = state;
+
+  if (db) {
+    try {
+      await db.query(
+        `INSERT INTO qav_sequence_states
+         (trajectory_id, sequence_id, current_state, previous_state,
+          last_action, steps_completed, created_at, updated_at, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (trajectory_id, sequence_id) DO NOTHING`,
+        [trajectoryId, sequence_id, 'START', null, null, 0, createdAt, createdAt, 'IN_PROGRESS']
+      );
+    } catch (e) {
+      console.error('[HSC-BINDING] initSequenceState error:', e.message);
+    }
+  }
+
+  return state;
+}
+
+// Vérifier si une transition est légitime selon le contrat
+function checkTransition(contract, currentState, proposedStep) {
+  if (!contract || !contract.transitions) {
+    return { valid: false, reason: 'NO_CONTRACT' };
+  }
+
+  const transitions = Array.isArray(contract.transitions)
+    ? contract.transitions
+    : Object.values(contract.transitions);
+
+  // Chercher la transition demandée
+  const transition = transitions.find(
+    t => t.from === currentState && (t.to === proposedStep || t.action === proposedStep)
+  );
+
+  if (!transition) {
+    // Chercher si l'étape existe dans le contrat (mais depuis un autre état)
+    const stepExists = transitions.some(
+      t => t.to === proposedStep || t.action === proposedStep
+    );
+
+    if (stepExists) {
+      // L'étape existe mais n'est pas accessible depuis l'état courant
+      const validFrom = transitions
+        .filter(t => t.to === proposedStep || t.action === proposedStep)
+        .map(t => t.from);
+      return {
+        valid:          false,
+        reason:         'PREMATURE_STEP',
+        current_state:  currentState,
+        proposed_step:  proposedStep,
+        valid_from:     validFrom,
+        decision:       'BLOCK',
+        hint:           `SHOW_PLACE requires completing: ${validFrom.join(', ')}`
+      };
+    }
+
+    return {
+      valid:         false,
+      reason:        'UNKNOWN_STEP',
+      current_state: currentState,
+      proposed_step: proposedStep,
+      decision:      'BLOCK'
+    };
+  }
+
+  // Vérifier les préconditions
+  const preconditions = contract.preconditions?.[proposedStep] || [];
+
+  return {
+    valid:         true,
+    reason:        'TRANSITION_VALID',
+    current_state: currentState,
+    next_state:    transition.to,
+    action:        transition.action,
+    requires:      transition.requires || [],
+    preconditions,
+    decision:      'ALLOW'
+  };
+}
+
+// Avancer l'état séquentiel APRÈS confirmation ACTION_RESULT
+async function advanceSequenceState(trajectoryId, sequence_id, next_state, action) {
+  const key       = `seq_state_${trajectoryId}_${sequence_id}`;
+  const existing  = inMemoryStore.sequence_states[key];
+  const updatedAt = now();
+
+  const updated = {
+    ...(existing || {}),
+    trajectory_id:   trajectoryId,
+    sequence_id,
+    previous_state:  existing?.current_state || 'START',
+    current_state:   next_state,
+    last_action:     action,
+    steps_completed: (existing?.steps_completed || 0) + 1,
+    updated_at:      updatedAt,
+    status:          'IN_PROGRESS'
+  };
+
+  inMemoryStore.sequence_states[key] = updated;
+
+  if (db) {
+    try {
+      await db.query(
+        `INSERT INTO qav_sequence_states
+         (trajectory_id, sequence_id, current_state, previous_state,
+          last_action, steps_completed, created_at, updated_at, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (trajectory_id, sequence_id)
+         DO UPDATE SET
+           current_state = EXCLUDED.current_state,
+           previous_state = EXCLUDED.previous_state,
+           last_action = EXCLUDED.last_action,
+           steps_completed = EXCLUDED.steps_completed,
+           updated_at = EXCLUDED.updated_at`,
+        [trajectoryId, sequence_id, next_state,
+         updated.previous_state, action,
+         updated.steps_completed,
+         updated.created_at || updatedAt, updatedAt, 'IN_PROGRESS']
+      );
+    } catch (e) {
+      console.error('[HSC-BINDING] advanceSequenceState error:', e.message);
+    }
+  }
+
+  await logEvent('SequenceStateAdvanced', {
+    trajectoryId, sequence_id,
+    previousState: updated.previous_state,
+    newState:      next_state,
+    action,
+    stepsCompleted: updated.steps_completed
+  });
+
+  return updated;
+}
+
+// GET /v1/sequences/state/:trajectoryId/:sequenceId · État courant d'une trajectoire
+app.get('/v1/sequences/state/:trajectoryId/:sequenceId', async (req, res) => {
+  const { trajectoryId, sequenceId } = req.params;
+
+  const state = await getSequenceState(trajectoryId, sequenceId);
+  if (!state) {
+    return res.status(404).json({
+      error: 'SEQUENCE_STATE_NOT_FOUND',
+      trajectoryId,
+      sequenceId,
+      hint: 'L\'état est initialisé au premier appel /v1/qavanah/check avec sequence_id'
+    });
+  }
+  res.json({ state });
+});
+
+// POST /v1/sequences/state/advance · Avancer l'état après ACTION_RESULT confirmé
+// Appelé uniquement après que TAL a confirmé l'exécution
+app.post('/v1/sequences/state/advance', async (req, res) => {
+  const { trajectoryId, sequence_id, next_state, action, actionResultId } = req.body;
+
+  if (!trajectoryId || !sequence_id || !next_state) {
+    return res.status(400).json({ error: 'TRAJECTORY_ID + SEQUENCE_ID + NEXT_STATE REQUIRED' });
+  }
+
+  // Vérifier que le contrat existe
+  const contract = await loadSequenceContract(sequence_id);
+  if (!contract) {
+    return res.status(404).json({ error: 'SEQUENCE_CONTRACT_NOT_FOUND', sequence_id });
+  }
+
+  // Vérifier que next_state existe dans les états du contrat
+  const states = Array.isArray(contract.states) ? contract.states : [];
+  if (!states.includes(next_state)) {
+    return res.status(400).json({
+      error:       'INVALID_NEXT_STATE',
+      next_state,
+      valid_states: states
+    });
+  }
+
+  const updated = await advanceSequenceState(trajectoryId, sequence_id, next_state, action);
+
+  res.json({
+    advanced:       true,
+    trajectoryId,
+    sequence_id,
+    previousState:  updated.previous_state,
+    currentState:   updated.current_state,
+    stepsCompleted: updated.steps_completed,
+    trigger:        'ACTION_RESULT_CONFIRMED',
+    actionResultId: actionResultId || null
+  });
+});
+
 // ── INIT DB ───────────────────────────────────────────────────────────────────
 async function initDb() {
   if (!db) return;
@@ -1751,6 +2098,18 @@ async function initDb() {
         status        TEXT DEFAULT 'DRAFT',
         created_at    TIMESTAMPTZ DEFAULT NOW(),
         checksum      TEXT
+      );
+      CREATE TABLE IF NOT EXISTS qav_sequence_states (
+        trajectory_id    TEXT NOT NULL,
+        sequence_id      TEXT NOT NULL,
+        current_state    TEXT NOT NULL DEFAULT 'START',
+        previous_state   TEXT,
+        last_action      TEXT,
+        steps_completed  INTEGER DEFAULT 0,
+        created_at       TIMESTAMPTZ DEFAULT NOW(),
+        updated_at       TIMESTAMPTZ DEFAULT NOW(),
+        status           TEXT DEFAULT 'IN_PROGRESS',
+        PRIMARY KEY (trajectory_id, sequence_id)
       );
     `);
     console.log('[QAVANAH] Tables vérifiées / créées v0.7.0 · incl. qav_sequence_contracts');
@@ -1825,11 +2184,11 @@ initDb().then(() => {
   app.listen(PORT, () => {
     console.log('');
     console.log('╔══════════════════════════════════════════════════════╗');
-    console.log('║   QAVANAH API™ v0.7.0 · Le Gardien de Trajectoire   ║');
+    console.log('║   QAVANAH API™ v0.8.0 · Le Gardien de Trajectoire   ║');
     console.log('║   Makom Intelligence™ · CorreIA LLC                  ║');
     console.log(`║   Port : ${PORT}  ·  Mode : ${QAVANAH_MODE.padEnd(7)}                    ║`);
-    console.log('║   HSC Registry · qav_sequence_contracts              ║');
-    console.log('║   SEQ-SEARCH-PLACE-001 v1.0 · ACTIVE · seedé        ║');
+    console.log('║   HSC Contract Binding · qav_sequence_states         ║');
+    console.log('║   État avance après ACTION_RESULT uniquement         ║');
     console.log('╚══════════════════════════════════════════════════════╝');
     console.log('');
   });
